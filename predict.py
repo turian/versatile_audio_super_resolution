@@ -1,10 +1,10 @@
+import math
 import os
 import random
 import tempfile
 
 import numpy as np
 import torch
-import math
 import torchaudio
 from cog import BasePredictor, Input, Path
 from torch.nn.functional import pad
@@ -19,6 +19,16 @@ MODELS = ["basic", "speech"]
 # seconds before input to AudioSR to get the best performance."
 WINDOW_AUDIO_LENGTH = 5.12
 OUTPUT_SAMPLE_RATE = 48000
+
+# THIS IS WHY WE CAN'T HAVE NICE THINGS, audiosr
+# returns audio that is a different length than expected.
+# For reasons I don't understand and that aren't documented:
+# 5.12 sec * 48000 = 245760 samples.
+# This is also divisible by 2048, the STFT window size they use.
+# Nonetheless, for 5.12 sec audio input, audiosr returns 245776
+# samples. They don't explain whether this is center or end padded
+# but my current best guess is that it's end padded.
+ACTUAL_AUDIOSR_OUTPUT_WINDOW_SAMPLES = 245776
 
 AUDIOSR_STFT_WINDOW_LENGTH = 2048
 
@@ -81,11 +91,11 @@ class Predictor(BasePredictor):
         if waveform.max().abs() > 1:
             waveform /= waveform.max().abs()
         if output_bitrate == 16:
-            out_wav = (waveform[0] * 32767).astype(np.int16).T
+            waveform = (waveform[0] * 32767).astype(np.int16).T
         else:
             assert output_bitrate == 32, "Unsupported output bitrate"
 
-        torchaudio.save("out.wav", out_wav, OUTPUT_SAMPLE_RATE)
+        torchaudio.save("out.wav", waveform.cpu(), OUTPUT_SAMPLE_RATE)
 
         return Path("out.wav")
 
@@ -111,22 +121,34 @@ class Predictor(BasePredictor):
         def upsample(n):
             return n * OUTPUT_SAMPLE_RATE // sample_rate
 
+        def upsample_and_stft_pad(n):
+            # Since STFT padding will occur, we need to adjust the num samples
+            n = upsample(n)
+            return int(
+                round(n / AUDIOSR_STFT_WINDOW_LENGTH) * AUDIOSR_STFT_WINDOW_LENGTH
+            )
+
         upsampled_num_samples = upsample(num_samples)
+
+        upsampled_window_size = upsample_and_stft_pad(window_size)
 
         # Apply padding to the waveform
         padded_waveform = self._apply_padding(waveform, pad_start, pad_end)
 
         upsampled_pad_start = upsample(pad_start)
 
-        upsampled_padded_num_samples = upsample(upsampled_num_samples)
-        # Since STFT padding will occur, we need to adjust the num samples
-        upsampled_padded_num_samples = int(math.round(upsampled_padded_num_samples / AUDIOSR_STFT_WINDOW_LENGTH) * AUDIOSR_STFT_WINDOW_LENGTH)
+        upsampled_padded_num_samples_from_audiosr_padding = upsample(windows[-1][0]) + ACTUAL_AUDIOSR_OUTPUT_WINDOW_SAMPLES
+        #upsampled_padded_num_samples = upsample(windows[-1][1])
 
-        upsampled_waveform_shape = (num_channels, upsample(padded_waveform.shape[1]))
+        # Doesn't work because audiosr doesn't explain why
+        # the padding changes on the audio
+        #upsampled_padded_num_samples = upsample_and_stft_pad(upsampled_num_samples)
+
+        upsampled_waveform_shape = (num_channels, upsampled_padded_num_samples_from_audiosr_padding)
         print(f"upsampled_waveform_shape: {upsampled_waveform_shape}")
 
         # Initialize the output waveform and window sums for averaging
-        output_waveform = torch.zeros(upsampled_waveform_shape)
+        output_waveform = torch.zeros(upsampled_waveform_shape).to(self.device)
         window_sums = torch.zeros(upsampled_waveform_shape[1]).to(self.device)
 
         # Process each window without batching
@@ -137,7 +159,10 @@ class Predictor(BasePredictor):
         # (Except I updated that so we CAN try.)
         for start, end in tqdm(windows):
             upsampled_start = upsample(start)
-            upsampled_end = upsample(end)
+            upsampled_end = upsample_and_stft_pad(end)
+            assert (
+                upsampled_end - upsampled_start == upsampled_window_size
+            ), f"{upsampled_end - upsampled_start} != {upsampled_window_size}"
             print(f"{start} -> {end}, {upsampled_start} -> {upsampled_end}")
 
             # Extract the current window from the padded waveform
@@ -163,19 +188,32 @@ class Predictor(BasePredictor):
                         ddim_steps=ddim_steps,
                         latent_t_per_second=12.8,
                     )
-                    assert output_window.ndim == 3 and output_window.shape[0] == 1, f"{output_window.ndim} != 3"
+                    # Gross, audiosr should fix this too
+                    output_window = torch.tensor(output_window, device=self.device)
+                    assert (
+                        output_window.ndim == 3 and output_window.shape[0] == 1
+                    ), f"{output_window.ndim} != 3"
                     output_window = output_window[0, :, :]
                     print(f"output shape: {output_window.shape}")
                     assert (
                         output_window.shape[0] == num_channels
                     ), f"{output_window.shape[0]} != {num_channels}"
+                    # assert (
+                    #    output_window.shape[1] == upsampled_end - upsampled_start
+                    # ), f"{output_window.shape[1]} > {upsampled_end - upsampled_start}"
+                    assert (
+                        output_window.shape[1] == ACTUAL_AUDIOSR_OUTPUT_WINDOW_SAMPLES
+                    ), f"{output_window.shape[1]} != {ACTUAL_AUDIOSR_OUTPUT_WINDOW_SAMPLES}"
 
             if output_window.shape[1] != upsampled_end - upsampled_start:
-                print(f"Waveform shape changed slightly during upsampling: {output_window.shape[1]}, expected: {upsampled_end - upsampled_start}")
-                # pad_wav pads the end so we adjust upsampled_end
+                print(
+                    f"Waveform shape changed slightly during upsampling: {output_window.shape[1]}, expected: {upsampled_end - upsampled_start}"
+                )
+                # Pad the end
                 upsampled_end = upsampled_start + output_window.shape[1]
-                #print(f"Upsampled end: {upsampled_end}")
-                #print(f"Upsampled start: {upsampled_start}")
+                # print(f"Upsampled end: {upsampled_end}")
+                # print(f"Upsampled start: {upsampled_start}")
+
             # Accumulate the output for overlapping windows
             output_waveform[:, upsampled_start:upsampled_end] += output_window
             window_sums[upsampled_start:upsampled_end] += 1
