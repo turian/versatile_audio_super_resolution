@@ -213,15 +213,16 @@ def read_wav_file(filename):
 
     waveform = torchaudio.functional.resample(waveform, sr, 48000)
 
-    ## WHY???? 
-    #waveform = waveform.numpy()[0, ...]
+    ### WHY???? 
+    waveform = waveform.numpy()[0, ...]
 
     waveform, mean_removed, max_val = normalize_wav(
-        waveform.numpy()
+        waveform
     )  # TODO rescaling the waveform will cause low LSD score
        # (thus I added denormalize_wav -jpt)
 
-    #waveform = waveform[None, ...]
+    ## WHY???? 
+    waveform = waveform[None, ...]
     print(f"target_length = {int(48000 * pad_duration)}")
     waveform = pad_wav(waveform, target_length=int(48000 * pad_duration))
 
@@ -229,9 +230,6 @@ def read_wav_file(filename):
     # in case we want to do overlap add on the waveform
     # WAIT WE SHOULD DO THIS ON THE OUTPUT
     waveform = denormalize_wav(waveform, mean_removed, max_val)
-
-    ## WHY????
-    waveform = waveform[None, ...]
 
     return waveform, target_frame, pad_duration
 
