@@ -100,8 +100,6 @@ class Predictor(BasePredictor):
         return Path("out.wav")
 
     def apply_model(self, input_file, model, ddim_steps, guidance_scale, overlap, seed):
-        # TODO: Applying a hanning window to the frames (windows) would be
-        # better overlap-add
         waveform, sample_rate = torchaudio.load(input_file)
         assert (
             sample_rate < OUTPUT_SAMPLE_RATE
@@ -117,6 +115,8 @@ class Predictor(BasePredictor):
         pad_start, pad_end, windows = prepare_windows(
             num_channels, num_samples, window_size, hop_length
         )
+
+        hanning_window = torch.hann_window(AUDIOSR_STFT_WINDOW_LENGTH, periodic=False).to(self.device)
 
         def upsample(n):
             return n * OUTPUT_SAMPLE_RATE // sample_rate
@@ -188,6 +188,7 @@ class Predictor(BasePredictor):
                         ddim_steps=ddim_steps,
                         latent_t_per_second=12.8,
                     )
+                    print(f"output shape: {output_window.shape}")
                     # Gross, audiosr should fix this too
                     output_window = torch.tensor(output_window, device=self.device)
                     assert (
@@ -197,7 +198,7 @@ class Predictor(BasePredictor):
                     print(f"output shape: {output_window.shape}")
                     assert (
                         output_window.shape[0] == num_channels
-                    ), f"{output_window.shape[0]} != {num_channels}"
+                    ), f"{output_window.shape[0]} != {num_channels}, output = {output_window.shape}"
                     # assert (
                     #    output_window.shape[1] == upsampled_end - upsampled_start
                     # ), f"{output_window.shape[1]} > {upsampled_end - upsampled_start}"
@@ -214,12 +215,13 @@ class Predictor(BasePredictor):
                 # print(f"Upsampled end: {upsampled_end}")
                 # print(f"Upsampled start: {upsampled_start}")
 
-            # Accumulate the output for overlapping windows
-            output_waveform[:, upsampled_start:upsampled_end] += output_window
-            window_sums[upsampled_start:upsampled_end] += 1
+            # Accumulate the output for overlapping windows, with hanning
+            assert upsampled_end - upsampled_start == hanning_window.shape[0], f"{upsampled_end - upsampled_start} != {hanning_window.shape[0]}"
+            output_waveform[:, upsampled_start:upsampled_end] += output_window * hanning_window
+            window_sums[upsampled_start:upsampled_end] += hanning_window
 
         # Avoid division by zero in window sums
-        window_sums[window_sums == 0] = 1
+        window_sums[window_sums == 0] = 1e-4
 
         # Average the overlapping windows
         output_waveform = output_waveform / window_sums
