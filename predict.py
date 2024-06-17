@@ -24,8 +24,8 @@ torch.set_float32_matmul_precision("high")
 
 
 class Predictor(BasePredictor):
-    def setup(self, device="auto"):
-        self.device = device
+    def setup(self):
+        self.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
         for model in MODELS:
             download_checkpoint(model)
         self.audiosrs = {}
@@ -64,7 +64,7 @@ class Predictor(BasePredictor):
             print(f"Setting seed to: {seed}")
 
         if model not in self.audiosrs:
-            self.audiosr[model] = build_model(model_name=model, device=self.device)
+            self.audiosrs[model] = build_model(model_name=model, device=self.device)
 
         waveform = self.apply_model(
             input_file=input_file,
@@ -80,14 +80,19 @@ class Predictor(BasePredictor):
         if output_bitrate == 16:
             out_wav = (waveform[0] * 32767).astype(np.int16).T
         else:
-            assert output_bitrate == 32
+            assert output_bitrate == 32, "Unsupported output bitrate"
 
-        torchaudio.save("out.wav", data=out_wav, samplerate=OUTPUT_SAMPLE_RATE)
+        torchaudio.save("out.wav", out_wav, OUTPUT_SAMPLE_RATE)
 
         return Path("out.wav")
 
     def apply_model(self, input_file, model, ddim_steps, guidance_scale, overlap, seed):
+        # TODO: Applying a hanning window to the frames (windows) would be
+        # better overlap-add
         waveform, sample_rate = torchaudio.load(input_file)
+        assert (
+            sample_rate < OUTPUT_SAMPLE_RATE
+        ), f"sample_rate: {sample_rate} should not exceed output_sample_rate: {OUTPUT_SAMPLE_RATE}"
 
         num_channels, num_samples = waveform.shape
 
@@ -100,15 +105,30 @@ class Predictor(BasePredictor):
             num_channels, num_samples, window_size, hop_length
         )
 
+        def upsample(n):
+            return n * OUTPUT_SAMPLE_RATE // sample_rate
+
         # Apply padding to the waveform
         padded_waveform = self._apply_padding(waveform, pad_start, pad_end)
 
+        upsampled_num_samples = upsample(num_samples)
+        upsampled_pad_start = upsample(pad_start)
+        upsampled_waveform_shape = (num_channels, upsampled_num_samples)
+
         # Initialize the output waveform and window sums for averaging
-        output_waveform = torch.zeros_like(padded_waveform)
-        window_sums = torch.zeros(padded_waveform.shape[1]).to(self.device)
+        output_waveform = torch.zeros(upsampled_waveform_shape)
+        window_sums = torch.zeros(upsampled_waveform_shape[1]).to(self.device)
 
         # Process each window without batching
+        # TODO: This could probably work in a batched way, if we dug into
+        # the super_resolution API. Actually just writing a file with a
+        # lot of channels might work, except the super_resolution
+        # normalization is opinionated and is not per-channel.
+        # (Except I updated that so we CAN try.)
         for start, end in tqdm(windows):
+            upsampled_start = upsample(start)
+            upsampled_end = upsample(end)
+
             # Extract the current window from the padded waveform
             windowed_waveform = padded_waveform[:, start:end]
 
@@ -118,7 +138,9 @@ class Predictor(BasePredictor):
             ), f"windowed_waveform shape: {windowed_waveform.shape[1]}, expected: {window_size}"
 
             with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-                torchaudio.save(f.name, data=windowed_waveform, sample_rate=sample_rate)
+                # We do this weird thing because the API of super_resolution
+                # is a bit opinionated
+                torchaudio.save(f.name, windowed_waveform, sample_rate)
 
                 with torch.no_grad():
                     output_window = super_resolution(
@@ -129,11 +151,21 @@ class Predictor(BasePredictor):
                         ddim_steps=ddim_steps,
                         latent_t_per_second=12.8,
                     )
-                    assert output_window.shape == windowed_waveform.shape
+                    assert output_window.ndim == 3 and output_window.shape[0] == 1, f"{output_window.ndim} != 3"
+                    output_window = output_window[0, :, :]
+                    assert (
+                        output_window.shape[0] == num_channels
+                    ), f"{output_window.shape[0]} != {num_channels}"
 
+            if output_window.shape[1] != upsampled_end - upsampled_start:
+                print(f"Waveform shape changed slightly during upsampling: {output_window.shape[1]}, expected: {upsampled_end - upsampled_start}")
+                # pad_wav pads the end so we adjust upsampled_end
+                upsampled_end = upsampled_start + output_window.shape[1]
+                #print(f"Upsampled end: {upsampled_end}")
+                #print(f"Upsampled start: {upsampled_start}")
             # Accumulate the output for overlapping windows
-            output_waveform[:, start:end] += output_window
-            window_sums[start:end] += 1
+            output_waveform[:, upsampled_start:upsampled_end] += output_window
+            window_sums[upsampled_start:upsampled_end] += 1
 
         # Avoid division by zero in window sums
         window_sums[window_sums == 0] = 1
@@ -142,7 +174,9 @@ class Predictor(BasePredictor):
         output_waveform = output_waveform / window_sums
 
         # Remove the padding to return to the original waveform length
-        output_waveform = output_waveform[:, pad_start : num_samples + pad_start]
+        output_waveform = output_waveform[
+            :, upsampled_pad_start : upsampled_num_samples + upsampled_pad_start
+        ]
 
         return output_waveform
 
@@ -181,7 +215,9 @@ def prepare_windows(
     # print(f"windows = {windows}")
 
     final_total_samples = windows[-1][1]
-    assert final_total_samples >= min_total_samples
+    assert (
+        final_total_samples >= min_total_samples
+    ), f"{final_total_samples} < {min_total_samples}"
 
     # We might end up with some blank extra windows at the beginning and end
     # but whatever, this implementation is CORRECT and SAFEa

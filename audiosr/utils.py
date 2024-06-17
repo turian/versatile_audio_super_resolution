@@ -180,11 +180,12 @@ def wav_feature_extraction(waveform, target_frame):
     return log_mel_spec, stft
 
 
+
 def normalize_wav(waveform):
-    # Remove DC offset
-    mean_removed = waveform - np.mean(waveform)
-    # Scale the waveform to the range [-0.5, 0.5]
-    max_val = np.max(np.abs(mean_removed)) + 1e-8
+    # Remove DC offset per channel
+    mean_removed = waveform - np.mean(waveform, axis=-1, keepdims=True)
+    # Calculate max value per channel to scale the waveform to [-0.5, 0.5]
+    max_val = np.max(np.abs(mean_removed), axis=-1, keepdims=True) + 1e-8
     normalized_waveform = mean_removed / max_val * 0.5
     return normalized_waveform, mean_removed, max_val
 
@@ -192,17 +193,19 @@ def denormalize_wav(normalized_waveform, mean_removed, max_val):
     # Re-scale to the original amplitude adjusted for the mean removal
     denormalized_waveform = normalized_waveform * max_val / 0.5
     # Re-add the mean value to restore the original DC offset
-    return denormalized_waveform + np.mean(mean_removed)
+    return denormalized_waveform + np.mean(mean_removed, axis=-1, keepdims=True)
 
 def read_wav_file(filename):
     waveform, sr = torchaudio.load(filename)
     duration = waveform.size(-1) / sr
+    print(f"Audio duration: {duration:.2f} seconds")
 
     if(duration > 10.24):
         print("\033[93m {}\033[00m" .format("Warning: audio is longer than 10.24 seconds, may degrade the model performance. It's recommand to truncate your audio to 5.12 seconds before input to AudioSR to get the best performance."))
 
     if(duration % 5.12 != 0):
         pad_duration = duration + (5.12 - duration % 5.12)
+        print(f"Audio duration is not a multiple of 5.12 seconds, padding audio to {pad_duration:.2f} seconds")
     else:
         pad_duration = duration
 
@@ -218,6 +221,7 @@ def read_wav_file(filename):
        # (thus I added denormalize_wav -jpt)
 
     waveform = waveform[None, ...]
+    print(f"target_length = {int(48000 * pad_duration)}")
     waveform = pad_wav(waveform, target_length=int(48000 * pad_duration))
     # Transform waveform back to original scale,
     # in case we want to do overlap add on the waveform
