@@ -108,12 +108,14 @@ class Predictor(BasePredictor):
         def upsample(n):
             return n * OUTPUT_SAMPLE_RATE // sample_rate
 
+        upsampled_num_samples = upsample(num_samples)
+
         # Apply padding to the waveform
         padded_waveform = self._apply_padding(waveform, pad_start, pad_end)
 
-        upsampled_num_samples = upsample(num_samples)
         upsampled_pad_start = upsample(pad_start)
-        upsampled_waveform_shape = (num_channels, upsampled_num_samples)
+        upsampled_waveform_shape = (num_channels, upsample(padded_waveform.shape[1]))
+        print(f"upsampled_waveform_shape: {upsampled_waveform_shape}")
 
         # Initialize the output waveform and window sums for averaging
         output_waveform = torch.zeros(upsampled_waveform_shape)
@@ -128,6 +130,7 @@ class Predictor(BasePredictor):
         for start, end in tqdm(windows):
             upsampled_start = upsample(start)
             upsampled_end = upsample(end)
+            print(f"{start} -> {end}, {upsampled_start} -> {upsampled_end}")
 
             # Extract the current window from the padded waveform
             windowed_waveform = padded_waveform[:, start:end]
@@ -143,6 +146,7 @@ class Predictor(BasePredictor):
                 torchaudio.save(f.name, windowed_waveform, sample_rate)
 
                 with torch.no_grad():
+                    print(f"input shape: {windowed_waveform.shape}")
                     output_window = super_resolution(
                         self.audiosrs[model],
                         f.name,
@@ -153,6 +157,7 @@ class Predictor(BasePredictor):
                     )
                     assert output_window.ndim == 3 and output_window.shape[0] == 1, f"{output_window.ndim} != 3"
                     output_window = output_window[0, :, :]
+                    print(f"output shape: {output_window.shape}")
                     assert (
                         output_window.shape[0] == num_channels
                     ), f"{output_window.shape[0]} != {num_channels}"
