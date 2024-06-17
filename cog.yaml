@@ -39,5 +39,12 @@ build:
     - "timm==0.9.7"
     - "audiosr==0.0.7"
 
+  # Commands run after environment is set up
+  # We cache the models in the Docker, so that we don't re-download them
+  # every prediction.
+  run:
+    - python3 -c "from audiosr import download_checkpoint; download_checkpoint('basic')"
+    - python3 -c "from audiosr import download_checkpoint; download_checkpoint('speech')"
+
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"

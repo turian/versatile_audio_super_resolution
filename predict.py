@@ -8,11 +8,7 @@ from cog import BasePredictor, Input, Path
 
 from audiosr import build_model, download_checkpoint, super_resolution
 
-MODEL_PATH = "/src/models/"
-
 MODELS = ["basic", "speech"]
-
-os.environ["HF_HOME"] = MODEL_PATH
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 torch.set_float32_matmul_precision("high")
