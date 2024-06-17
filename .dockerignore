@@ -1,14 +1,6 @@
-*.pyc
-__pycache__
-test.py
-flagged
-output
-gradio_cached*
-*egg-info
-build*
-*.wav
-dist/
-*DS_Store*
+# The .dockerignore file excludes files from the container build process.
+#
+# https://docs.docker.com/engine/reference/builder/#dockerignore-file
 
 # Exclude Git files
 .git
