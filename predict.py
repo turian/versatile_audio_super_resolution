@@ -4,6 +4,7 @@ import tempfile
 
 import numpy as np
 import torch
+import math
 import torchaudio
 from cog import BasePredictor, Input, Path
 from torch.nn.functional import pad
@@ -18,6 +19,8 @@ MODELS = ["basic", "speech"]
 # seconds before input to AudioSR to get the best performance."
 WINDOW_AUDIO_LENGTH = 5.12
 OUTPUT_SAMPLE_RATE = 48000
+
+AUDIOSR_STFT_WINDOW_LENGTH = 2048
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 torch.set_float32_matmul_precision("high")
@@ -114,6 +117,11 @@ class Predictor(BasePredictor):
         padded_waveform = self._apply_padding(waveform, pad_start, pad_end)
 
         upsampled_pad_start = upsample(pad_start)
+
+        upsampled_padded_num_samples = upsample(upsampled_num_samples)
+        # Since STFT padding will occur, we need to adjust the num samples
+        upsampled_padded_num_samples = int(math.round(upsampled_padded_num_samples / AUDIOSR_STFT_WINDOW_LENGTH) * AUDIOSR_STFT_WINDOW_LENGTH)
+
         upsampled_waveform_shape = (num_channels, upsample(padded_waveform.shape[1]))
         print(f"upsampled_waveform_shape: {upsampled_waveform_shape}")
 
