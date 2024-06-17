@@ -181,9 +181,18 @@ def wav_feature_extraction(waveform, target_frame):
 
 
 def normalize_wav(waveform):
-    waveform = waveform - np.mean(waveform)
-    waveform = waveform / (np.max(np.abs(waveform)) + 1e-8)
-    return waveform * 0.5
+    # Remove DC offset
+    mean_removed = waveform - np.mean(waveform)
+    # Scale the waveform to the range [-0.5, 0.5]
+    max_val = np.max(np.abs(mean_removed)) + 1e-8
+    normalized_waveform = mean_removed / max_val * 0.5
+    return normalized_waveform, mean_removed, max_val
+
+def denormalize_wav(normalized_waveform, mean_removed, max_val):
+    # Re-scale to the original amplitude adjusted for the mean removal
+    denormalized_waveform = normalized_waveform * max_val / 0.5
+    # Re-add the mean value to restore the original DC offset
+    return denormalized_waveform + np.mean(mean_removed)
 
 def read_wav_file(filename):
     waveform, sr = torchaudio.load(filename)
@@ -203,12 +212,16 @@ def read_wav_file(filename):
 
     waveform = waveform.numpy()[0, ...]
 
-    waveform = normalize_wav(
+    waveform, mean_removed, max_val = normalize_wav(
         waveform
     )  # TODO rescaling the waveform will cause low LSD score
+       # (thus I added denormalize_wav -jpt)
 
     waveform = waveform[None, ...]
     waveform = pad_wav(waveform, target_length=int(48000 * pad_duration))
+    # Transform waveform back to original scale,
+    # in case we want to do overlap add on the waveform
+    waveform = denormalize_wav(waveform, mean_removed, max_val)
     return waveform, target_frame, pad_duration
 
 def read_audio_file(filename):

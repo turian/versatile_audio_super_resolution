@@ -1,14 +1,23 @@
 import os
 import random
+import tempfile
 
 import numpy as np
 import torch
 import torchaudio
 from cog import BasePredictor, Input, Path
+from torch.nn.functional import pad
+from tqdm import tqdm
 
 from audiosr import build_model, download_checkpoint, super_resolution
 
 MODELS = ["basic", "speech"]
+
+# " Warning: audio is longer than 10.24 seconds, may degrade the
+# model performance. It's recommand to truncate your audio to 5.12
+# seconds before input to AudioSR to get the best performance."
+WINDOW_AUDIO_LENGTH = 5.12
+OUTPUT_SAMPLE_RATE = 48000
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 torch.set_float32_matmul_precision("high")
@@ -16,9 +25,7 @@ torch.set_float32_matmul_precision("high")
 
 class Predictor(BasePredictor):
     def setup(self, device="auto"):
-        self.model_name = model_name
         self.device = device
-        self.sr = 48000
         for model in MODELS:
             download_checkpoint(model)
         self.audiosrs = {}
@@ -40,6 +47,10 @@ class Predictor(BasePredictor):
             ge=1.0,
             le=20.0,
         ),
+        overlap: float = Input(
+            description="Window overlap, higher will give better predictions, between 0 and 1",
+            default=0.75,
+        ),
         seed: int = Input(
             description="Random seed. Leave blank to randomize the seed", default=None
         ),
@@ -52,16 +63,16 @@ class Predictor(BasePredictor):
             seed = random.randint(0, 2**32 - 1)
             print(f"Setting seed to: {seed}")
 
-        if model not in audiosrs:
+        if model not in self.audiosrs:
             self.audiosr[model] = build_model(model_name=model, device=self.device)
 
-        waveform = super_resolution(
-            self.audiosrs[model],
-            input_file,
-            seed=seed,
-            guidance_scale=guidance_scale,
+        waveform = self.apply_model(
+            input_file=input_file,
+            model=model,
             ddim_steps=ddim_steps,
-            latent_t_per_second=12.8,
+            guidance_scale=guidance_scale,
+            overlap=overlap,
+            seed=seed,
         )
 
         if waveform.max().abs() > 1:
@@ -71,9 +82,120 @@ class Predictor(BasePredictor):
         else:
             assert output_bitrate == 32
 
-        torchaudio.save("out.wav", data=out_wav, samplerate=48000)
+        torchaudio.save("out.wav", data=out_wav, samplerate=OUTPUT_SAMPLE_RATE)
 
         return Path("out.wav")
+
+    def apply_model(self, input_file, model, ddim_steps, guidance_scale, overlap, seed):
+        waveform, sample_rate = torchaudio.load(input_file)
+
+        num_channels, num_samples = waveform.shape
+
+        # Define window and hop length
+        window_size = int(WINDOW_AUDIO_LENGTH * sample_rate)
+        hop_length = int(window_size * (1 - overlap))
+
+        # Prepare windows and padding amounts
+        pad_start, pad_end, windows = prepare_windows(
+            num_channels, num_samples, window_size, hop_length
+        )
+
+        # Apply padding to the waveform
+        padded_waveform = self._apply_padding(waveform, pad_start, pad_end)
+
+        # Initialize the output waveform and window sums for averaging
+        output_waveform = torch.zeros_like(padded_waveform)
+        window_sums = torch.zeros(padded_waveform.shape[1]).to(self.device)
+
+        # Process each window without batching
+        for start, end in tqdm(windows):
+            # Extract the current window from the padded waveform
+            windowed_waveform = padded_waveform[:, start:end]
+
+            # Assert that each windowed_waveform is exactly window_size
+            assert (
+                windowed_waveform.shape[1] == window_size
+            ), f"windowed_waveform shape: {windowed_waveform.shape[1]}, expected: {window_size}"
+
+            with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+                torchaudio.save(f.name, data=windowed_waveform, sample_rate=sample_rate)
+
+                with torch.no_grad():
+                    output_window = super_resolution(
+                        self.audiosrs[model],
+                        f.name,
+                        seed=seed,
+                        guidance_scale=guidance_scale,
+                        ddim_steps=ddim_steps,
+                        latent_t_per_second=12.8,
+                    )
+                    assert output_window.shape == windowed_waveform.shape
+
+            # Accumulate the output for overlapping windows
+            output_waveform[:, start:end] += output_window
+            window_sums[start:end] += 1
+
+        # Avoid division by zero in window sums
+        window_sums[window_sums == 0] = 1
+
+        # Average the overlapping windows
+        output_waveform = output_waveform / window_sums
+
+        # Remove the padding to return to the original waveform length
+        output_waveform = output_waveform[:, pad_start : num_samples + pad_start]
+
+        return output_waveform
+
+    def _apply_padding(self, waveform, pad_start, pad_end):
+        try:
+            padded_waveform = pad(waveform, (pad_start, pad_end), mode="reflect")
+        except:
+            # Fallback to constant padding if reflect padding fails
+            padded_waveform = pad(waveform, (pad_start, pad_end))
+        return padded_waveform
+
+
+def prepare_windows(
+    num_channels: int, num_samples: int, window_size: int, hop_length: int
+):
+    """
+    Prepare windows for batched processing and overlap add.
+
+    Let's just keep this simple and clean.
+    We will definitely add at least window_size padding on each side.
+    (Slightly inefficient for short audio.)
+
+    We then construct windows at least this length, of window_size length.
+
+    Finally, we reverse engineer the padding.
+    """
+    # print(f"num_samples={num_samples}, window_size={window_size}, hop_length={hop_length}")
+
+    # We will definitely add at least window_size padding on each side
+    min_total_samples = num_samples + 2 * window_size
+
+    windows = [(0, window_size)]
+    while windows[-1][1] < min_total_samples:
+        windows.append((windows[-1][0] + hop_length, windows[-1][1] + hop_length))
+
+    # print(f"windows = {windows}")
+
+    final_total_samples = windows[-1][1]
+    assert final_total_samples >= min_total_samples
+
+    # We might end up with some blank extra windows at the beginning and end
+    # but whatever, this implementation is CORRECT and SAFEa
+    total_padding_needed = final_total_samples - num_samples
+
+    # print(f"total_padding_needed = {total_padding_needed}")
+
+    # Determine the padding for the start and end
+    pad_start = total_padding_needed // 2
+    pad_end = total_padding_needed - pad_start
+
+    # print(f"pad_start = {pad_start}, pad_end = {pad_end}")
+
+    return pad_start, pad_end, windows
 
 
 if __name__ == "__main__":
